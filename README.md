@@ -60,19 +60,19 @@
                            INTERNET
                                │
                                │
-                  ┌────────────────────────┐
-                  │  NGINX Reverse Proxy   │
-                  │  Load Balancer         │
+                  ┌──────────────────────────────┐
+                  │  NGINX Reverse Proxy         │
+                  │  Load Balancer               │
                   │  IP Física: 192.168.100.168  │
                   │  IP VLAN:  192.168.208.2     │
-                  │  Usuario:  adming8      │
-                  └──────────┬─────────────┘
+                  │  Usuario:  adming8           │
+                  └──────────┬───────────────────┘
                              │
               ┌──────────────┼──────────────┐
               │                             │
    ┌──────────▼──────────┐     ┌───────────▼─────────┐
    │       APP1          │     │        APP2          │
-   │  IP: 100.169/208.3  │     │  IP: 100.170/208.4  │
+   │  IP: 100.169/208.3  │     │  IP: 100.170/208.4   │
    │  Node.js + PM2      │     │  Node.js + PM2       │
    └──────────┬──────────┘     └───────────┬──────────┘
               │                             │
@@ -82,7 +82,7 @@
                 │         MariaDB          │
                 │  IP: 100.171 / 208.5     │
                 │  Base de Datos: socdb    │
-                │  Tablas: usuarios,        │
+                │  Tablas: usuarios,       │
                 │  incidentes, alertas     │
                 └────────────┬─────────────┘
                              │  Logs / Métricas
@@ -110,12 +110,12 @@
 
 | VM / Host | Rol | IP Física | IP VLAN | Usuario | SO |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **VM1 – NGINX** | Reverse Proxy + Load Balancer | 192.168.100.168 | 192.168.208.2 | adming8 | Ubuntu 22.04 |
-| **VM2 – APP1** | Servidor de Aplicación 1 (Node.js + PM2) | 192.168.100.169 | 192.168.208.3 | adming8 | Ubuntu 22.04 |
-| **VM3 – APP2** | Servidor de Aplicación 2 (Node.js + PM2) | 192.168.100.170 | 192.168.208.4 | adming8 | Ubuntu 22.04 |
-| **VM4 – DB** | Base de Datos MariaDB Central | 192.168.100.171 | 192.168.208.5 | adming8 | Ubuntu 22.04 |
-| **VM5 – SOC Server** | Monitoreo, Detección y Respuesta | 192.168.100.172 | 192.168.208.6 | adming8 | Ubuntu 22.04 |
-| **VM6 – Backups** | Backups, Restore y Simulación de Ataques | 192.168.100.173 | 192.168.208.7 | adming8 | Ubuntu 22.04 |
+| **VM1 – NGINX** | Reverse Proxy + Load Balancer | 192.168.100.168 | 192.168.208.2 | adming8 | Ubuntu 24.04.4 LTS |
+| **VM2 – APP1** | Servidor de Aplicación 1 (Node.js + PM2) | 192.168.100.169 | 192.168.208.3 | adming8 | Ubuntu 24.04.4 LTS |
+| **VM3 – APP2** | Servidor de Aplicación 2 (Node.js + PM2) | 192.168.100.170 | 192.168.208.4 | adming8 | Ubuntu 24.04.4 LTS |
+| **VM4 – DB** | Base de Datos MariaDB Central | 192.168.100.171 | 192.168.208.5 | adming8 | Ubuntu 24.04.4 LTS |
+| **VM5 – SOC Server** | Monitoreo, Detección y Respuesta | 192.168.100.172 | 192.168.208.6 | adming8 | Ubuntu 24.04.4 LTS |
+| **VM6 – Backups** | Backups, Restore y Simulación de Ataques | 192.168.100.173 | 192.168.208.7 | adming8 | Ubuntu 24.04.4 LTS |
 
 ### 4.3. Estrategia de Diseño
 
@@ -129,7 +129,7 @@
 
 ### 5.1. Pre-requisitos
 
-* 6 VMs con Ubuntu 22.04 LTS, acceso root/sudo, y conectividad en la red VLAN 192.168.208.0/24.
+* 6 VMs con Ubuntu 24.04.4 LTS, acceso root/sudo, y conectividad en la red VLAN 192.168.208.0/24.
 * Repositorio del proyecto clonado en cada VM.
 * NGINX, Node.js, PM2, MariaDB, Prometheus, Grafana, Fail2Ban instalados en sus respectivas VMs.
 * Hydra, Nmap y stress-ng instalados en VM6 (Backup & Attack Server).
@@ -172,8 +172,15 @@ pm2 list
 -- Creación de base de datos SOC
 CREATE DATABASE socdb;
 USE socdb;
-CREATE TABLE usuarios (id INT AUTO_INCREMENT PRIMARY KEY, nombre VARCHAR(100), rol VARCHAR(50));
-CREATE TABLE incidentes (id INT AUTO_INCREMENT PRIMARY KEY, tipo VARCHAR(100), fecha DATETIME, estado VARCHAR(50));
+CREATE TABLE `usuarios` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `nombre` varchar(100) NOT NULL,
+  `correo` varchar(150) DEFAULT NULL,
+  `edad` int(11) DEFAULT NULL,
+  `fecha_registro` timestamp NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `correo` (`correo`)
+)
 ```
 
 **VM5 – SOC Server**
@@ -198,13 +205,67 @@ sudo fail2ban-client set sshd unbanip 192.168.208.7
 
 ```bash
 # Script de backup automático
-# /opt/soc/backup_manager.sh
-mysqldump -h 192.168.208.5 -u root -p socdb > /backups/socdb_$(date +%Y%m%d_%H%M).sql
-gzip /backups/socdb_$(date +%Y%m%d_%H%M).sql
+# /backups/backup_database.sh
+#!/bin/bash
+
+DATE=$(date +%F_%H-%M)
+
+mysqldump \
+-h 192.168.208.5 \
+-u backup \
+-pjosias \
+socdb > /backups/database/$DATE.sql
+
+gzip /backups/database/$DATE.sql
+
 
 # Script de restore
-# /opt/soc/restore_database.sh
-gunzip -c /backups/socdb_latest.sql.gz | mysql -h 192.168.208.5 -u root -p socdb
+# /backups/recuperar.sh
+#!/bin/bash
+
+# Configuración de variables (T1 / T15)
+DIR_RESPALDOS="/backups/database"
+DB_HOST="192.168.208.5"
+DB_USER="backup"
+DB_PASS="josias"
+DB_NAME="socdb"
+
+echo "===================================================="
+echo "      SISTEMA DE RECUPERACIÓN ANTE DESASTRES - SOC  "
+echo "===================================================="
+
+# 1. Listar los respaldos disponibles para que el usuario elija
+echo "=== Respaldos disponibles en el sistema:"
+# Opción corregida y robusta:
+ls -1 "$DIR_RESPALDOS"/*.sql.gz 2>/dev/null | xargs -L 1 basename
+echo "----------------------------------------------------"
+
+# 2. Solicitar al administrador qué archivo usar
+read -p "- Escribe el nombre exacto del archivo a restaurar (ej: 2026-06-07_17-14.sql.gz): " ARCHIVO_ELEGIDO
+
+RUTA_COMPLETA="$DIR_RESPALDOS/$ARCHIVO_ELEGIDO"
+
+# Validar que el archivo realmente exista
+if [ ! -f "$RUTA_COMPLETA" ]; then
+    echo "!!! x Error: El archivo '$ARCHIVO_ELEGIDO' no existe."
+    exit 1
+fi
+
+echo "... Iniciando restauración de la base de datos desde la VLAN..."
+
+# 3. La magia de la recuperación en una sola línea sin extraer en disco de forma permanente (T14)
+# 'zcat' lee el contenido comprimido al vuelo y lo envía por tubería '|' al cliente de mysql remoto
+zcat "$RUTA_COMPLETA" | mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME"
+
+# 4. Verificación del estado de salida del comando anterior
+if [ ${PIPESTATUS[1]} -eq 0 ]; then
+    echo "===================================================="
+    echo "✓ ¡ÉXITO! La base de datos '$DB_NAME' ha sido restaurada."
+    echo "   Estado: Operacional a partir del respaldo: $ARCHIVO_ELEGIDO"
+    echo "===================================================="
+else
+    echo "!!! Error crítico: Falló la inyección del respaldo en el servidor remoto."
+fi
 ```
 
 ### 5.3. Ficheros de Configuración Clave
@@ -214,8 +275,8 @@ gunzip -c /backups/socdb_latest.sql.gz | mysql -h 192.168.208.5 -u root -p socdb
 | `/etc/nginx/sites-available/socshield.conf` | Configuración del proxy inverso y balanceo de carga |
 | `/etc/fail2ban/jail.local` | Reglas de detección y bloqueo de fuerza bruta SSH |
 | `/etc/prometheus/prometheus.yml` | Scrape targets de todas las VMs |
-| `/opt/soc/backup_manager.sh` | Backup automático de MariaDB con compresión |
-| `/opt/soc/restore_database.sh` | Restauración automática de la base de datos |
+| `/backups/backup_database.sh` | Backup automático de MariaDB con compresión |
+| `/backups/recuperar.sh` | Restauración automática de la base de datos |
 | `/opt/soc/health_check.sh` | Verificación de estado de todos los servicios |
 | `/opt/soc/soc_menu.sh` | Menú interactivo SOC Command Center |
 
@@ -391,4 +452,4 @@ El proyecto **SOC** logró integrar exitosamente los conceptos fundamentales de 
 
 ---
 
-*Informe generado para la Feria de Proyectos — SIS313: Infraestructura, Plataformas Tecnológicas y Redes — Universidad San Francisco Xavier de Chuquisaca — Semestre 1/2026*
+*Informe — SIS313: Infraestructura, Plataformas Tecnológicas y Redes — Universidad San Francisco Xavier de Chuquisaca — Semestre 1/2026*
