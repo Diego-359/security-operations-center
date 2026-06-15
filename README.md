@@ -35,10 +35,11 @@
 * **NGINX:** Proxy inverso y balanceador de carga con Rate Limiting, HSTS y registro centralizado de accesos. Distribuye tráfico entre APP1 y APP2 con detección automática de caídas (health checks).
 * **Node.js + PM2:** Servidor de aplicación web (Portal SOC de incidentes) en APP1 y APP2, gestionado por PM2 para restart automático y monitoreo de procesos.
 * **MariaDB:** Base de datos central (`socdb`) que almacena usuarios, incidentes, alertas y eventos del SOC. Utilizada también para demostrar escenarios de corrupción y recuperación.
-* **Prometheus + Node Exporter:** Recolección de métricas del sistema (CPU, RAM, red, disponibilidad de servicios) desde todas las VMs.
-* **Grafana:** Dashboard principal del SOC. Visualiza métricas en tiempo real, genera alertas visuales ante incidentes (caída de nodo, picos de tráfico, servicios offline).
-* **Fail2Ban:** Detección y bloqueo automático de ataques de fuerza bruta SSH. Monitorea `/var/log/auth.log`.
-* **Scripts Bash SOC:** Automatización de health checks, respuesta a incidentes, backup/restore de base de datos y generación de reportes.
+* **Prometheus + Node Exporter:** Recolección centralizada de métricas de CPU, memoria, disco y disponibilidad desde todas las VMs de la infraestructura (APP1, APP2, MariaDB, SOC y Backup).
+* **Grafana:** Plataforma de visualización utilizada para construir dashboards de monitoreo en tiempo real del SOC. Permite observar el estado de los nodos, recursos del sistema y disponibilidad de servicios críticos.
+* **Fail2Ban:** Sistema de detección y respuesta ante intentos de acceso no autorizados. Analiza registros de autenticación SSH y aplica bloqueos automáticos a direcciones IP sospechosas.
+* **rsyslog:** Servicio utilizado para la centralización de eventos y registros provenientes de distintas máquinas de la infraestructura, facilitando el análisis de incidentes.
+* **SOC Command Center (Bash):** Consola administrativa desarrollada mediante scripts Bash que integra monitoreo, consulta de servicios, generación de reportes, evidencias, backups remotos y gestión básica de incidentes desde una única interfaz.
 * **Hydra / Nmap / stress-ng (VM6):** Herramientas de simulación de ataques para los escenarios demostrativos de la feria.
 
 ### 3.2. Conceptos de la Asignatura Puestos en Práctica (T1 – T6)
@@ -136,35 +137,608 @@
 
 ### 5.2. Configuración por VM
 
-**VM1 – NGINX (Proxy + Balanceador)**
+La configuración utilizada en los servidores siguió la siguiente estructura:
 
-```nginx
-# /etc/nginx/sites-available/socshield.conf
-upstream socapp {
-    server 192.168.208.3:3000;
-    server 192.168.208.4:3000;
-}
+```yaml
+network:
+  version: 2
+  renderer: networkd
 
-server {
-    listen 80;
-    location / {
-        proxy_pass http://socapp;
-        limit_req zone=one burst=20 nodelay;
-    }
-}
+  ethernets:
+    ens18:
+      addresses:
+        - 192.168.100.169/24
+
+      routes:
+        - to: default
+          via: 192.168.100.1
+
+  vlans:
+    vlan208:
+      id: 208
+      link: ens18
+
+      addresses:
+        - 192.168.208.X/28
 ```
 
-**VM2 y VM3 – APP1 y APP2 (Node.js + PM2)**
+La utilización de una VLAN dedicada permitió aislar la infraestructura del proyecto respecto a otros grupos alojados dentro de la misma supercomputadora.
+
+---
+# Configuración de Hostnames y Resolución de Nombres
+
+Con el objetivo de simplificar la administración y facilitar futuras modificaciones de infraestructura, se configuraron nombres lógicos para cada servidor.
+
+Ejemplos:
 
 ```bash
-# Iniciar aplicación con PM2
-pm2 start app.js --name app1
-pm2 save
-pm2 startup
-
-# Verificar estado
-pm2 list
+hostnamectl set-hostname nginx-lb
+hostnamectl set-hostname app1
+hostnamectl set-hostname app2
 ```
+
+Posteriormente se configuró resolución local mediante el archivo:
+
+```bash
+/etc/hosts
+```
+
+Agregando las siguientes entradas:
+
+```text
+192.168.208.2 nginx-lb
+192.168.208.3 app1
+192.168.208.4 app2
+192.168.208.5 mariadb
+192.168.208.6 monitoreo
+192.168.208.7 backup
+```
+
+Gracias a esta configuración fue posible utilizar nombres de host dentro de NGINX y los scripts administrativos, evitando el uso constante de direcciones IP.
+
+---
+# Implementación del Balanceador de Carga NGINX
+
+La máquina virtual nginx-lb fue configurada como punto único de entrada para todas las solicitudes realizadas por los usuarios.
+
+La instalación se realizó mediante:
+
+```bash
+sudo apt update
+sudo apt install nginx -y
+```
+
+La configuración principal fue almacenada en:
+
+```bash
+/etc/nginx/sites-available/soc
+```
+
+y posteriormente habilitada mediante:
+
+```bash
+ln -s /etc/nginx/sites-available/soc /etc/nginx/sites-enabled/soc
+```
+
+La validación de la sintaxis se realizó utilizando:
+
+```bash
+nginx -t
+```
+
+y la configuración fue aplicada mediante:
+
+```bash
+systemctl reload nginx
+```
+
+---
+## Configuración del Upstream
+
+Para implementar balanceo de carga se creó un grupo de servidores denominado:
+
+```nginx
+upstream soc_backend {
+
+    least_conn;
+
+    server app1:3000 max_fails=3 fail_timeout=30s;
+    server app2:3000 max_fails=3 fail_timeout=30s;
+
+}
+```
+#### Failover Automático
+
+Cada backend fue configurado con:
+
+```nginx
+max_fails=3
+fail_timeout=30s
+```
+
+Si un servidor presenta tres errores consecutivos durante treinta segundos, NGINX deja de enviarle tráfico temporalmente.
+
+Esto permite mantener la disponibilidad incluso cuando una aplicación presenta fallos.
+
+---
+# Implementación de HTTPS
+
+Con el objetivo de proteger las comunicaciones entre clientes y servidores se configuró HTTPS.
+
+Los certificados utilizados fueron almacenados en:
+
+```text
+/etc/ssl/certs/soc.crt
+/etc/ssl/private/soc.key
+```
+
+La redirección automática fue configurada mediante:
+
+```nginx
+server {
+
+    listen 80;
+
+    return 301 https://$host$request_uri;
+
+}
+```
+
+Posteriormente se habilitó HTTPS mediante:
+
+```nginx
+listen 443 ssl http2;
+```
+
+y se restringieron los protocolos permitidos:
+
+```nginx
+ssl_protocols TLSv1.2 TLSv1.3;
+```
+
+Con esta configuración se eliminaron protocolos inseguros y se garantizó que todo el tráfico viaje cifrado.
+
+---
+
+# Hardening del Servidor Web
+
+Como parte del fortalecimiento de la superficie de exposición se aplicaron diversas configuraciones de hardening.
+
+Se ocultó la versión de NGINX mediante:
+
+```nginx
+server_tokens off;
+```
+
+para evitar que un atacante identifique fácilmente la versión utilizada.
+
+También se implementaron cabeceras de seguridad:
+
+```nginx
+add_header Strict-Transport-Security "max-age=31536000" always;
+add_header X-Frame-Options "DENY" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin" always;
+add_header X-XSS-Protection "1; mode=block" always;
+add_header Permissions-Policy "geolocation=()" always;
+```
+
+Estas políticas ayudan a mitigar ataques de Clickjacking, XSS y filtración de información.
+
+---
+
+# Protección contra Reconocimiento y Escaneo
+
+Como parte del enfoque Detectar y Responder se implementó una política básica de bloqueo de herramientas ofensivas.
+
+La configuración aplicada fue:
+
+```nginx
+if ($http_user_agent ~* "(sqlmap|nikto|nmap|masscan|wpscan)") {
+    return 403;
+}
+```
+
+Cuando una solicitud contiene alguno de estos User-Agent, NGINX responde automáticamente:
+
+```text
+403 Forbidden
+```
+
+Las pruebas fueron realizadas mediante:
+
+```bash
+curl -A "sqlmap" https://192.168.208.2 -k
+```
+
+obteniendo el resultado esperado.
+
+---
+
+# Implementación de Rate Limiting
+
+Con el objetivo de reducir el impacto de ataques automatizados se implementó limitación de solicitudes.
+
+Configuración:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=soclimit:10m rate=5r/s;
+```
+
+y posteriormente:
+
+```nginx
+limit_req zone=soclimit burst=10 nodelay;
+```
+
+La política permite:
+
+* 5 solicitudes por segundo por IP.
+* Ráfagas controladas de hasta 10 solicitudes.
+* Reducción del impacto de ataques básicos de denegación de servicio.
+
+---
+
+# Preparación para Monitoreo
+
+Con el objetivo de integrar Grafana y Prometheus se habilitó el módulo Stub Status.
+
+Configuración:
+
+```nginx
+location /nginx_status {
+
+    stub_status;
+
+    allow 192.168.208.6;
+    deny all;
+
+}
+```
+
+Esta funcionalidad permite exponer métricas relacionadas con:
+
+* Conexiones activas.
+* Solicitudes procesadas.
+* Estado operativo de NGINX.
+
+El acceso fue restringido exclusivamente al servidor de monitoreo.
+
+---
+
+# Desarrollo del Portal SOC Incident Portal
+
+## Estructura del Proyecto
+
+La aplicación fue desplegada en APP1 y APP2 dentro del directorio:
+
+```bash
+/opt/soc-app
+```
+
+Inicialmente el portal mostraba únicamente información estática.
+
+Posteriormente se decidió transformarlo en una herramienta de validación de infraestructura capaz de verificar simultáneamente:
+
+* Estado de APP1 y APP2.
+* Funcionamiento del balanceador.
+* Disponibilidad de MariaDB.
+* Visualización de datos reales almacenados en la base de datos.
+
+---
+
+## Instalación de Dependencias
+
+Se instaló NodeJS:
+
+```bash
+sudo apt install nodejs npm -y
+```
+
+Posteriormente se instaló la librería de conexión a MariaDB:
+
+```bash
+cd /opt/soc-app
+
+npm install mysql2
+```
+
+---
+
+## Información Mostrada por el Portal
+
+La aplicación fue diseñada para mostrar información útil durante las pruebas operativas.
+
+Elementos mostrados:
+
+* Backend activo.
+* Hostname del servidor.
+* Estado de la aplicación.
+* Estado de la base de datos.
+* Total de usuarios registrados.
+* Fecha y hora del servidor.
+* Tabla completa de usuarios.
+
+Esta información permite validar visualmente el correcto funcionamiento de toda la infraestructura.
+
+---
+
+## Identificación del Backend Activo
+
+Para verificar el funcionamiento del balanceador se implementó identificación dinámica del servidor que responde cada solicitud.
+
+La aplicación utiliza:
+
+```javascript
+curl hhtp://192.168.100.168
+```
+
+permitiendo visualizar:
+
+```text
+Backend APP1
+```
+
+o
+
+```text
+Backend APP2
+```
+
+según el servidor seleccionado por NGINX.
+
+---
+
+## Integración con MariaDB
+
+La aplicación establece conexión con:
+
+```text
+Servidor: 192.168.208.5
+Base de Datos: socdb
+Tabla: usuarios
+```
+
+Cada vez que un usuario accede al portal se ejecuta:
+
+```sql
+SELECT * FROM usuarios;
+```
+
+mostrando información real almacenada en la base de datos.
+
+Campos visualizados:
+
+* id
+* nombre
+* correo
+* edad
+* fecha_registro
+
+---
+
+# Administración de Aplicaciones con PM2
+
+Con el objetivo de mantener disponibilidad continua se utilizó PM2.
+
+Instalación:
+
+```bash
+npm install -g pm2
+```
+
+Despliegue:
+
+```bash
+pm2 start app.js --name app1
+
+pm2 save
+
+pm2 startup
+```
+
+Administración:
+
+```bash
+pm2 list
+pm2 restart app1
+pm2 stop app1
+pm2 logs app1
+```
+
+PM2 permite reinicio automático ante fallos y persistencia tras reinicios del sistema.
+
+---
+
+# Automatización Operativa mediante Bash
+
+Todos los scripts fueron almacenados en:
+
+```bash
+/opt/soc
+```
+
+El objetivo fue reducir tareas manuales y facilitar la operación del SOC.
+
+---
+
+## app_status.sh
+
+Función:
+
+* Consultar APP1.
+* Consultar APP2.
+* Verificar estado PM2 remotamente.
+
+Código:
+
+```bash
+#!/bin/bash
+
+echo "====== APP STATUS ======"
+
+ssh app1 "pm2 list"
+
+echo
+
+ssh app2 "pm2 list"
+```
+
+---
+
+## health_check.sh
+
+Función:
+
+* Verificar APP1.
+* Verificar APP2.
+* Verificar NGINX.
+
+Código:
+
+```bash
+#!/bin/bash
+
+echo "=== HEALTH CHECK ==="
+
+curl -s http://app1:3000 > /dev/null
+
+if [ $? -eq 0 ]
+then
+    echo "APP1 OK"
+else
+    echo "APP1 DOWN"
+fi
+
+curl -s http://app2:3000 > /dev/null
+
+if [ $? -eq 0 ]
+then
+    echo "APP2 OK"
+else
+    echo "APP2 DOWN"
+fi
+
+systemctl is-active nginx
+```
+
+---
+
+## lb_status.sh
+
+Función:
+
+* Verificar NGINX.
+* Mostrar conexiones activas.
+
+Código:
+
+```bash
+#!/bin/bash
+
+echo "====== LOAD BALANCER ======"
+
+systemctl status nginx --no-pager
+
+echo
+echo "Conexiones activas"
+
+ss -ant | grep ':80' | wc -l
+```
+
+---
+
+# Desarrollo del SOC Command Center
+
+Con el objetivo de centralizar todas las tareas operativas se desarrolló una consola administrativa propia denominada:
+
+```text
+SOC COMMAND CENTER
+```
+
+Ubicación:
+
+```bash
+/opt/soc/soc_menu.sh
+```
+
+Antes de su implementación era necesario ejecutar manualmente múltiples comandos para verificar el estado de la infraestructura.
+
+La consola fue desarrollada para actuar como una capa de orquestación sobre los scripts previamente creados.
+
+Al ejecutarse:
+
+```bash
+bash /opt/soc/soc_menu.sh
+```
+
+presenta un menú interactivo con opciones de monitoreo y administración.
+
+Funciones integradas:
+
+1. Estado de Aplicaciones.
+2. Health Check.
+3. Estado del Balanceador.
+4. Visualización de Logs.
+5. Consulta de Conexiones Activas.
+6. Salida del sistema.
+
+La herramienta permite realizar verificaciones rápidas sin necesidad de recordar comandos individuales.
+
+Durante la feria tecnológica será utilizada como consola principal de operación y demostración del SOC.
+
+---
+
+# Automatización mediante Llaves SSH
+
+Inicialmente los scripts requerían ingreso manual de contraseñas.
+
+Para automatizar completamente la ejecución se implementó autenticación mediante llaves SSH.
+
+Generación:
+
+```bash
+ssh-keygen -t ed25519
+```
+
+Distribución:
+
+```bash
+ssh-copy-id ruls@app1
+ssh-copy-id ruls@app2
+```
+
+Validación:
+
+```bash
+ssh app1
+ssh app2
+```
+
+Gracias a esta configuración fue posible ejecutar consultas remotas desde nginx-lb sin intervención del operador.
+
+---
+
+# Pruebas Realizadas
+
+Las pruebas efectuadas sobre la infraestructura implementada fueron:
+
+| Prueba               | Resultado |
+| -------------------- | --------- |
+| Balanceo APP1 ↔ APP2 | Exitosa   |
+| Failover APP1        | Exitosa   |
+| HTTPS                | Exitosa   |
+| TLS 1.2/1.3          | Exitosa   |
+| Integración MariaDB  | Exitosa   |
+| Consulta de usuarios | Exitosa   |
+| PM2                  | Exitosa   |
+| SSH Keys             | Exitosa   |
+| Rate Limiting        | Exitosa   |
+| Bloqueo SQLMap       | Exitosa   |
+| nginx_status         | Exitosa   |
+| SOC Command Center   | Exitosa   |
+
+Los resultados obtenidos demostraron el correcto funcionamiento de la infraestructura implementada y su integración con el resto de componentes del SOC.
 
 **VM4 – Base de Datos (MariaDB)**
 
@@ -185,21 +759,307 @@ CREATE TABLE `usuarios` (
 
 **VM5 – SOC Server**
 
+La máquina virtual VM5 fue configurada como el Centro de Operaciones de Seguridad (SOC) de la infraestructura.
+
+Funciones implementadas:
+
+* Monitoreo centralizado mediante Prometheus.
+* Visualización de métricas mediante Grafana.
+* Recolección de métricas de todas las VMs mediante Node Exporter.
+* Detección básica de incidentes mediante Fail2Ban.
+* Administración centralizada mediante SOC Command Center.
+* Ejecución de backups y restauraciones remotas.
+* Generación de reportes operativos.
+* Automatización mediante scripts Bash.
+
+### Instalación de Prometheus
+
 ```bash
-# Configuración de Fail2Ban
-# /etc/fail2ban/jail.local
-[sshd]
-enabled  = true
-maxretry = 5
-bantime  = 3600
-findtime = 600
+sudo useradd --no-create-home --shell /bin/false prometheus
 
-# Verificar estado de Fail2Ban
-sudo fail2ban-client status sshd
+sudo mkdir /etc/prometheus
+sudo mkdir /var/lib/prometheus
 
-# Desbloquear IP manualmente (para resetear demo)
-sudo fail2ban-client set sshd unbanip 192.168.208.7
+sudo chown prometheus:prometheus /etc/prometheus
+sudo chown prometheus:prometheus /var/lib/prometheus
 ```
+
+Archivo principal:
+
+```bash
+nano /etc/prometheus/prometheus.yml
+```
+
+Configuración utilizada:
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+        - localhost:9090
+
+  - job_name: 'soc-server'
+    static_configs:
+      - targets:
+        - 192.168.208.6:9100
+
+  - job_name: 'nginx'
+    static_configs:
+      - targets:
+        - 192.168.208.2:9100
+
+  - job_name: 'app1'
+    static_configs:
+      - targets:
+        - 192.168.208.3:9100
+
+  - job_name: 'app2'
+    static_configs:
+      - targets:
+        - 192.168.208.4:9100
+
+  - job_name: 'mariadb'
+    static_configs:
+      - targets:
+        - 192.168.208.5:9100
+
+  - job_name: 'backup'
+    static_configs:
+      - targets:
+        - 192.168.208.7:9100
+```
+
+### Node Exporter
+
+Se instaló Node Exporter en las máquinas monitoreadas para exponer métricas de:
+
+* CPU
+* Memoria
+* Disco
+* Red
+* Disponibilidad del sistema
+
+Puerto utilizado:
+
+```text
+9100/TCP
+```
+
+Dashboards implementados:
+
+## 1: Dashboard de Monitoreo SOC
+
+Se implementó un sistema de monitoreo centralizado mediante Prometheus y Grafana en el servidor SOC (192.168.208.6).
+
+### Data Source
+
+Se configuró Grafana para utilizar Prometheus como origen de datos principal:
+
+* URL: `https://cyber-soc-monitoring.rootcode.com.bo`
+* Estado: Conectado
+
+### Hosts Monitoreados
+
+Prometheus recopila métricas mediante Node Exporter desde los siguientes servidores:
+
+| Servidor              | Dirección          |
+| --------------------- | ------------------ |
+| NGINX / Balanceador   | 192.168.208.2:9100 |
+| Aplicación 1          | 192.168.208.3:9100 |
+| Aplicación 2          | 192.168.208.4:9100 |
+| Base de Datos MariaDB | 192.168.208.5:9100 |
+| SOC Server            | 192.168.208.6:9100 |
+| Backup Server         | 192.168.208.7:9100 |
+
+Todos los nodos se encuentran en estado **UP**, permitiendo la recopilación continua de métricas.
+
+### Dashboard Principal SOC
+
+Se construyó un dashboard centralizado compuesto por los siguientes paneles:
+
+#### Estado de Infraestructura
+
+Visualización en tiempo real del estado de todos los servidores monitoreados.
+
+Consulta utilizada:
+
+```promql
+up
+```
+
+Función:
+
+* Detectar nodos activos.
+* Identificar caídas de servidores.
+* Mostrar disponibilidad general de la infraestructura.
+
+---
+
+#### Uso de CPU
+
+Monitoreo del porcentaje de utilización del procesador en cada servidor.
+
+Consulta utilizada:
+
+```promql
+100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+```
+
+Función:
+
+* Identificar sobrecarga de procesamiento.
+* Detectar comportamientos anómalos.
+* Monitorear rendimiento general.
+
+---
+
+#### Uso de Memoria RAM
+
+Monitoreo del consumo de memoria de los servidores.
+
+Consulta utilizada:
+
+```promql
+(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)
+/
+node_memory_MemTotal_bytes
+* 100
+```
+
+Función:
+
+* Detectar agotamiento de memoria.
+* Identificar posibles fugas de memoria.
+* Supervisar estabilidad de los servicios.
+
+---
+
+#### Uso de Disco
+
+Monitoreo del espacio utilizado en el sistema de archivos principal.
+
+Consulta utilizada:
+
+```promql
+100 - (
+node_filesystem_avail_bytes{mountpoint="/"}
+/
+node_filesystem_size_bytes{mountpoint="/"}
+*100
+)
+```
+
+Función:
+
+* Detectar almacenamiento insuficiente.
+* Supervisar crecimiento de logs.
+* Evitar interrupciones por falta de espacio.
+
+---
+
+#### Estado de Prometheus
+
+Panel de supervisión del servicio Prometheus.
+
+Consulta utilizada:
+
+```promql
+prometheus_build_info
+```
+
+Función:
+
+* Verificar disponibilidad del motor de monitoreo.
+* Confirmar versión instalada.
+* Validar operación correcta del servicio.
+
+---
+
+#### Inventario de Servidores
+
+Listado de los servidores registrados en el sistema de monitoreo.
+
+Consulta utilizada:
+
+```promql
+node_uname_info
+```
+
+Función:
+
+* Identificar servidores activos.
+* Verificar sistema operativo.
+* Mostrar información del kernel y arquitectura.
+
+
+### 2: Dashboard Node Exporter Full (ID: 1860)
+
+Dashboard oficial importado desde Grafana Dashboard Library.
+
+Permite visualizar:
+
+* CPU
+* Memoria RAM
+* Disco
+* Sistema de archivos
+* Tráfico de red
+* Load Average
+* Uptime
+* Procesos activos
+
+El dashboard utiliza métricas proporcionadas por Node Exporter desde todas las máquinas monitoreadas.
+
+### Fail2Ban
+
+Configuración utilizada:
+
+```bash
+/etc/fail2ban/jail.local
+```
+
+```ini
+[sshd]
+enabled=true
+maxretry=5
+findtime=600
+bantime=3600
+```
+
+Validación:
+
+```bash
+sudo fail2ban-client status sshd
+```
+
+
+### SOC Command Center
+
+Ubicación:
+
+```bash
+~/SOC/menu.sh
+```
+
+Funciones implementadas:
+
+* Estado General
+* Estado de Servicios
+* Estado MariaDB
+* Health Check
+* Generación de Reportes
+* Centro de Incidentes
+* Consulta de Backups
+* Backup Remoto
+* Restore Remoto
+* Dashboard Grafana
+* Dashboard Prometheus
+
+La consola fue desarrollada para reducir tareas manuales y centralizar las operaciones del SOC desde una única interfaz.
 
 **VM6 – Backup & Attack Server**
 
@@ -282,27 +1142,49 @@ fi
 
 ### 5.4. SOC Command Center (Menú Interactivo)
 
-```text
-==================================
-      SOC COMMAND CENTER
-==================================
- [1]  Estado General
- [2]  Incidentes Activos
- [3]  Ver Alertas
- [4]  Ejecutar Backup
- [5]  Restaurar Backup
- [6]  Health Check General
- [7]  Estado de Aplicaciones
- [8]  Estado de Base de Datos
- [9]  Estado de Fail2Ban
- [10] Estado de Firewall
- [11] Ver Logs Centralizados
- [12] Generar Reporte
- [13] Respuesta Automática
- [14] Simular Ataque
- [15] Salir
-==================================
+La consola administrativa fue desarrollada en Bash para centralizar tareas operativas del SOC.
+
+Ubicación:
+
+```bash
+~/SOC/scripts/soc_center.sh
 ```
+
+Opciones implementadas:
+
+```text
+=========================================
+         SOC COMMAND CENTER
+=========================================
+
+ [1] Estado General
+ [2] Estado Servicios
+ [3] Health Check
+ [4] Estado MariaDB
+ [5] Generar Reporte
+ [6] Información del Sistema
+ [7] Simular Incidente
+ [8] Dashboard Grafana
+ [9] Dashboard Prometheus
+ [10] Backup Remoto
+ [11] Estado Monitoreo
+ [12] Centro de Incidentes
+
+ [0] Salir
+
+=========================================
+```
+
+Funciones principales:
+
+* Verificación de servicios críticos.
+* Monitoreo de Prometheus.
+* Acceso rápido a Grafana.
+* Consulta del estado de MariaDB.
+* Generación de reportes operativos.
+* Ejecución de respaldos remotos.
+* Visualización de incidentes.
+* Automatización de tareas de monitoreo.
 
 ---
 
